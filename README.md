@@ -2807,13 +2807,17 @@ void dds_example() {
 } // namespace robot
 ```
 
-### 16.2 Advanced DDS Patterns
+### 16.2 Advanced DDS Patterns (Complete)
 
 ```cpp
 // dds_advanced.cpp
+#include <dds/dds.hpp>
+#include <future>
+#include <chrono>
+
 namespace robot {
 
-// Request-Reply pattern
+// Complete Request-Reply Service Implementation
 class DDSService {
     using Request = robot_msgs::ServiceRequest;
     using Reply = robot_msgs::ServiceReply;
@@ -2821,16 +2825,24 @@ class DDSService {
     dds::domain::DomainParticipant participant;
     dds::topic::Topic<Request> request_topic;
     dds::topic::Topic<Reply> reply_topic;
+    std::atomic<bool> running{true};
     
 public:
     DDSService(int domain_id) : participant(domain_id) {
+        // QoS for request-reply pattern
+        auto req_qos = dds::core::QosProvider::Default()
+            .topic_qos()
+            .reliability().reliable()
+            .history().keep_last(10)
+            .durability().transient_local();
+        
         request_topic = dds::topic::Topic<Request>(
-            participant, "service_request");
+            participant, "service_request", req_qos);
         reply_topic = dds::topic::Topic<Reply>(
-            participant, "service_reply");
+            participant, "service_reply", req_qos);
     }
     
-    // Service provider
+    // Service provider implementation
     void provide_service(std::function<Reply(const Request&)> handler) {
         auto reader = dds::sub::DataReader<Request>(
             dds::sub::Subscriber(participant), request_topic);
@@ -2838,22 +2850,37 @@ public:
             dds::pub::Publisher(participant), reply_topic);
         
         while (running) {
-            auto samples = reader.read();
+            // Use waitset for efficient waiting
+            dds::core::cond::WaitSet waitset;
+            dds::sub::cond::ReadCondition read_condition(
+                reader,
+                dds::sub::status::DataState::any());
             
-            for (const auto& sample : samples) {
-                if (sample.info().valid()) {
-                    Reply reply = handler(sample.data());
-                    reply.request_id(sample.data().request_id());
-                    writer.write(reply);
+            waitset.attach_condition(read_condition);
+            
+            // Wait for data with timeout
+            auto conditions = waitset.wait(dds::core::Duration::from_millisecs(100));
+            
+            if (!conditions.empty()) {
+                auto samples = reader.take();
+                
+                for (const auto& sample : samples) {
+                    if (sample.info().valid()) {
+                        try {
+                            Reply reply = handler(sample.data());
+                            reply.request_id(sample.data().request_id());
+                            writer.write(reply);
+                        } catch (const std::exception& e) {
+                            fmt::print(stderr, "Service handler error: {}\n", e.what());
+                        }
+                    }
                 }
             }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
     
-    // Service client
-    std::future<Reply> call_service(const Request& request) {
+    // Async service client
+    std::future<Reply> call_service_async(const Request& request) {
         auto promise = std::make_shared<std::promise<Reply>>();
         auto future = promise->get_future();
         
@@ -2871,3 +2898,1898 @@ public:
         std::thread([reader, request_id, promise]() mutable {
             auto timeout = std::chrono::steady_clock::now() + 
                           std::chrono::seconds(5);
+            
+            while (std::chrono::steady_clock::now() < timeout) {
+                auto samples = reader.take();
+                
+                for (const auto& sample : samples) {
+                    if (sample.info().valid() && 
+                        sample.data().request_id() == request_id) {
+                        promise->set_value(sample.data());
+                        return;
+                    }
+                }
+                
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            
+            promise->set_exception(std::make_exception_ptr(
+                std::runtime_error("Service call timeout")));
+        }).detach();
+        
+        // Send request
+        auto writer = dds::pub::DataWriter<Request>(
+            dds::pub::Publisher(participant), request_topic);
+        writer.write(req);
+        
+        return future;
+    }
+    
+    void shutdown() {
+        running = false;
+    }
+};
+
+// QoS Profiles for different use cases
+class QoSProfiles {
+public:
+    // Best effort for high-frequency sensor data
+    static dds::topic::qos::TopicQos sensor_data_qos() {
+        return dds::core::QosProvider::Default()
+            .topic_qos()
+            .reliability().best_effort()
+            .history().keep_last(1)
+            .durability().volatile_durability()
+            .deadline().deadline_period(dds::core::Duration::from_millisecs(10))
+            .liveliness().automatic().lease_duration(dds::core::Duration::from_secs(1));
+    }
+    
+    // Reliable for commands
+    static dds::topic::qos::TopicQos command_qos() {
+        return dds::core::QosProvider::Default()
+            .topic_qos()
+            .reliability().reliable()
+            .history().keep_all()
+            .durability().transient_local()
+            .lifespan().lifespan_duration(dds::core::Duration::from_secs(10));
+    }
+    
+    // Large data transfer
+    static dds::topic::qos::TopicQos large_data_qos() {
+        return dds::core::QosProvider::Default()
+            .topic_qos()
+            .reliability().reliable()
+            .history().keep_last(5)
+            .resource_limits()
+                .max_samples(5)
+                .max_instances(1)
+                .max_samples_per_instance(5);
+    }
+};
+
+// Discovery and monitoring
+class DDSMonitor {
+    dds::domain::DomainParticipant participant;
+    
+public:
+    explicit DDSMonitor(int domain_id) : participant(domain_id) {
+        // Set up built-in topic readers
+        auto subscriber = dds::sub::Subscriber(participant);
+        
+        // Monitor participant discovery
+        auto participant_reader = dds::sub::DataReader<dds::topic::ParticipantBuiltinTopicData>(
+            subscriber,
+            dds::topic::participant_topic(participant));
+        
+        participant_reader.listener(
+            new ParticipantListener(),
+            dds::core::status::StatusMask::data_available());
+    }
+    
+private:
+    class ParticipantListener : public dds::sub::NoOpDataReaderListener<dds::topic::ParticipantBuiltinTopicData> {
+    public:
+        void on_data_available(dds::sub::DataReader<dds::topic::ParticipantBuiltinTopicData>& reader) {
+            auto samples = reader.take();
+            
+            for (const auto& sample : samples) {
+                if (sample.info().valid()) {
+                    const auto& data = sample.data();
+                    
+                    if (sample.info().state().instance_state() == dds::sub::status::InstanceState::alive()) {
+                        fmt::print("Participant discovered: {}\n", 
+                                  data.key().value()[0]);
+                    } else {
+                        fmt::print("Participant lost: {}\n", 
+                                  data.key().value()[0]);
+                    }
+                }
+            }
+        }
+    };
+};
+
+} // namespace robot
+```
+
+---
+
+## 17. Message Design and Serialization
+
+### 17.1 Efficient Message Design
+
+```cpp
+// message_design.cpp
+#include <cstring>
+#include <vector>
+#include <msgpack.hpp>
+
+namespace robot {
+
+// Efficient binary message format
+#pragma pack(push, 1)  // Disable padding
+struct CompactJointState {
+    uint32_t timestamp_ms;
+    float positions[6];
+    float velocities[6];
+    uint8_t status_flags;
+    
+    // Serialization helpers
+    static constexpr size_t SIZE = sizeof(CompactJointState);
+    
+    void to_bytes(uint8_t* buffer) const {
+        std::memcpy(buffer, this, SIZE);
+    }
+    
+    static CompactJointState from_bytes(const uint8_t* buffer) {
+        CompactJointState state;
+        std::memcpy(&state, buffer, SIZE);
+        return state;
+    }
+};
+#pragma pack(pop)
+
+// MessagePack serialization for flexible messages
+struct FlexibleCommand {
+    int motor_id;
+    std::string command_type;
+    std::vector<float> parameters;
+    std::map<std::string, float> metadata;
+    
+    MSGPACK_DEFINE(motor_id, command_type, parameters, metadata);
+};
+
+class MessageSerializer {
+public:
+    // Serialize to MessagePack
+    static std::vector<uint8_t> serialize(const FlexibleCommand& cmd) {
+        msgpack::sbuffer buffer;
+        msgpack::pack(buffer, cmd);
+        
+        return std::vector<uint8_t>(buffer.data(), 
+                                    buffer.data() + buffer.size());
+    }
+    
+    // Deserialize from MessagePack
+    static Result<FlexibleCommand> deserialize(const std::vector<uint8_t>& data) {
+        try {
+            msgpack::object_handle oh = msgpack::unpack(
+                reinterpret_cast<const char*>(data.data()), data.size());
+            
+            FlexibleCommand cmd;
+            oh.get().convert(cmd);
+            return Ok(cmd);
+        } catch (const msgpack::exception& e) {
+            return Err<FlexibleCommand>(ErrorCode::DESERIALIZATION_FAILED);
+        }
+    }
+};
+
+// Ring buffer for message history
+template<typename T, size_t N>
+class MessageHistory {
+    std::array<T, N> buffer;
+    std::array<uint64_t, N> timestamps;
+    size_t write_index = 0;
+    bool full = false;
+    
+public:
+    void add(const T& message) {
+        buffer[write_index] = message;
+        timestamps[write_index] = get_timestamp_us();
+        
+        write_index = (write_index + 1) % N;
+        if (write_index == 0) {
+            full = true;
+        }
+    }
+    
+    std::vector<T> get_recent(size_t count) const {
+        std::vector<T> recent;
+        size_t available = full ? N : write_index;
+        count = std::min(count, available);
+        
+        for (size_t i = 0; i < count; ++i) {
+            size_t idx = (write_index - 1 - i + N) % N;
+            recent.push_back(buffer[idx]);
+        }
+        
+        return recent;
+    }
+    
+    std::optional<T> get_at_time(uint64_t timestamp) const {
+        size_t available = full ? N : write_index;
+        
+        for (size_t i = 0; i < available; ++i) {
+            if (timestamps[i] == timestamp) {
+                return buffer[i];
+            }
+        }
+        
+        return std::nullopt;
+    }
+};
+
+} // namespace robot
+```
+
+---
+
+## Part V: User Interface
+
+## 18. ImGui Fundamentals
+
+### 18.1 Basic ImGui Setup
+
+```cpp
+// imgui_setup.cpp
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+#include <GLFW/glfw3.h>
+
+namespace robot {
+
+class ImGuiApplication {
+    GLFWwindow* window = nullptr;
+    ImGuiContext* imgui_context = nullptr;
+    
+public:
+    Result<void> initialize() {
+        // Initialize GLFW
+        if (!glfwInit()) {
+            return Err<void>(ErrorCode::GUI_INIT_FAILED);
+        }
+        
+        // GL version
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        
+        // Create window
+        window = glfwCreateWindow(1280, 720, "Robot Control Panel", nullptr, nullptr);
+        if (!window) {
+            glfwTerminate();
+            return Err<void>(ErrorCode::GUI_WINDOW_FAILED);
+        }
+        
+        glfwMakeContextCurrent(window);
+        glfwSwapInterval(1); // Enable vsync
+        
+        // Setup ImGui
+        IMGUI_CHECKVERSION();
+        imgui_context = ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+        
+        // Setup style
+        ImGui::StyleColorsDark();
+        
+        // Setup platform/renderer bindings
+        ImGui_ImplGlfw_InitForOpenGL(window, true);
+        ImGui_ImplOpenGL3_Init("#version 330");
+        
+        return Ok();
+    }
+    
+    void run() {
+        while (!glfwWindowShouldClose(window)) {
+            glfwPollEvents();
+            
+            // Start ImGui frame
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+            
+            // Render UI
+            render_ui();
+            
+            // Rendering
+            ImGui::Render();
+            int display_w, display_h;
+            glfwGetFramebufferSize(window, &display_w, &display_h);
+            glViewport(0, 0, display_w, display_h);
+            glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            
+            glfwSwapBuffers(window);
+        }
+    }
+    
+    void shutdown() {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext(imgui_context);
+        
+        glfwDestroyWindow(window);
+        glfwTerminate();
+    }
+    
+private:
+    void render_ui() {
+        // Main menu bar
+        if (ImGui::BeginMainMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Open Config")) {
+                    // Handle open
+                }
+                if (ImGui::MenuItem("Save Config")) {
+                    // Handle save
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Exit")) {
+                    glfwSetWindowShouldClose(window, true);
+                }
+                ImGui::EndMenu();
+            }
+            
+            if (ImGui::BeginMenu("View")) {
+                ImGui::MenuItem("Show Metrics", nullptr, &show_metrics);
+                ImGui::MenuItem("Show Logs", nullptr, &show_logs);
+                ImGui::EndMenu();
+            }
+            
+            ImGui::EndMainMenuBar();
+        }
+        
+        // Docking space
+        ImGui::DockSpaceOverViewport(ImGui::GetMainViewport());
+        
+        // Various windows
+        render_control_panel();
+        render_telemetry();
+        render_diagnostics();
+        
+        if (show_metrics) {
+            ImGui::ShowMetricsWindow(&show_metrics);
+        }
+    }
+    
+    bool show_metrics = false;
+    bool show_logs = false;
+    
+    void render_control_panel();
+    void render_telemetry();
+    void render_diagnostics();
+};
+
+} // namespace robot
+```
+
+### 18.2 Robot Control Interface
+
+```cpp
+// imgui_robot_control.cpp
+namespace robot {
+
+class RobotControlPanel {
+    // Robot state
+    std::array<float, 6> joint_positions = {0};
+    std::array<float, 6> joint_targets = {0};
+    std::array<float, 6> joint_velocities = {0};
+    std::array<float, 6> joint_torques = {0};
+    
+    // Control modes
+    enum ControlMode { POSITION, VELOCITY, TORQUE };
+    ControlMode control_mode = POSITION;
+    
+    // Safety
+    bool emergency_stop = false;
+    bool motors_enabled = false;
+    
+    // Plotting data
+    static constexpr size_t PLOT_HISTORY = 1000;
+    std::array<float, PLOT_HISTORY> position_history = {0};
+    size_t history_offset = 0;
+    
+public:
+    void render() {
+        // Control Window
+        ImGui::Begin("Robot Control", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        
+        // Emergency Stop Button
+        ImGui::PushStyleColor(ImGuiCol_Button, 
+            emergency_stop ? IM_COL32(255, 0, 0, 255) : IM_COL32(128, 0, 0, 255));
+        
+        if (ImGui::Button("EMERGENCY STOP", ImVec2(200, 50))) {
+            emergency_stop = !emergency_stop;
+            if (emergency_stop) {
+                motors_enabled = false;
+                // Trigger actual emergency stop
+            }
+        }
+        ImGui::PopStyleColor();
+        
+        ImGui::Separator();
+        
+        // Motor Enable/Disable
+        if (ImGui::Checkbox("Motors Enabled", &motors_enabled)) {
+            if (motors_enabled && !emergency_stop) {
+                // Enable motors
+            } else {
+                // Disable motors
+            }
+        }
+        
+        ImGui::Separator();
+        
+        // Control Mode Selection
+        ImGui::Text("Control Mode:");
+        ImGui::RadioButton("Position", (int*)&control_mode, POSITION);
+        ImGui::SameLine();
+        ImGui::RadioButton("Velocity", (int*)&control_mode, VELOCITY);
+        ImGui::SameLine();
+        ImGui::RadioButton("Torque", (int*)&control_mode, TORQUE);
+        
+        ImGui::Separator();
+        
+        // Joint Controls
+        ImGui::Text("Joint Controls:");
+        
+        for (int i = 0; i < 6; ++i) {
+            ImGui::PushID(i);
+            
+            ImGui::Text("Joint %d", i + 1);
+            ImGui::SameLine(100);
+            
+            // Current position display
+            ImGui::Text("Pos: %.2f°", joint_positions[i] * 180.0f / M_PI);
+            ImGui::SameLine(200);
+            
+            // Target control
+            switch (control_mode) {
+                case POSITION: {
+                    float target_deg = joint_targets[i] * 180.0f / M_PI;
+                    if (ImGui::SliderFloat("##target", &target_deg, -180, 180, "%.1f°")) {
+                        joint_targets[i] = target_deg * M_PI / 180.0f;
+                    }
+                    break;
+                }
+                case VELOCITY: {
+                    ImGui::SliderFloat("##vel", &joint_velocities[i], -3.14f, 3.14f, "%.2f rad/s");
+                    break;
+                }
+                case TORQUE: {
+                    ImGui::SliderFloat("##torque", &joint_torques[i], -10.0f, 10.0f, "%.1f Nm");
+                    break;
+                }
+            }
+            
+            ImGui::PopID();
+        }
+        
+        ImGui::Separator();
+        
+        // Send Command Button
+        if (ImGui::Button("Send Command", ImVec2(200, 30))) {
+            if (motors_enabled && !emergency_stop) {
+                send_command();
+            }
+        }
+        
+        // Preset Positions
+        ImGui::Separator();
+        ImGui::Text("Preset Positions:");
+        
+        if (ImGui::Button("Home")) {
+            for (int i = 0; i < 6; ++i) {
+                joint_targets[i] = 0;
+            }
+        }
+        ImGui::SameLine();
+        
+        if (ImGui::Button("Ready")) {
+            joint_targets = {0, -M_PI/4, M_PI/4, 0, M_PI/2, 0};
+        }
+        ImGui::SameLine();
+        
+        if (ImGui::Button("Stow")) {
+            joint_targets = {0, -M_PI/2, M_PI/2, 0, 0, 0};
+        }
+        
+        ImGui::End();
+        
+        // Telemetry Window
+        render_telemetry();
+        
+        // Diagnostics Window
+        render_diagnostics();
+    }
+    
+private:
+    void render_telemetry() {
+        ImGui::Begin("Telemetry");
+        
+        // Joint position plot
+        if (ImPlot::BeginPlot("Joint Positions", ImVec2(-1, 300))) {
+            ImPlot::SetupAxes("Time", "Position (rad)");
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0, PLOT_HISTORY, ImGuiCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, -M_PI, M_PI);
+            
+            for (int i = 0; i < 6; ++i) {
+                std::string label = fmt::format("Joint {}", i + 1);
+                ImPlot::PlotLine(label.c_str(), 
+                                position_history.data(), 
+                                PLOT_HISTORY, 
+                                1.0, 
+                                0.0, 
+                                ImPlotLineFlags_None, 
+                                history_offset);
+            }
+            
+            ImPlot::EndPlot();
+        }
+        
+        // Statistics table
+        if (ImGui::BeginTable("Stats", 7, ImGuiTableFlags_Borders)) {
+            ImGui::TableSetupColumn("Joint");
+            ImGui::TableSetupColumn("Position");
+            ImGui::TableSetupColumn("Velocity");
+            ImGui::TableSetupColumn("Torque");
+            ImGui::TableSetupColumn("Temperature");
+            ImGui::TableSetupColumn("Current");
+            ImGui::TableSetupColumn("Status");
+            ImGui::TableHeadersRow();
+            
+            for (int i = 0; i < 6; ++i) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("J%d", i + 1);
+                
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%.2f°", joint_positions[i] * 180.0f / M_PI);
+                
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%.2f", joint_velocities[i]);
+                
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("%.1f", joint_torques[i]);
+                
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%.1f°C", get_temperature(i));
+                
+                ImGui::TableSetColumnIndex(5);
+                ImGui::Text("%.2fA", get_current(i));
+                
+                ImGui::TableSetColumnIndex(6);
+                ImGui::TextColored(is_fault(i) ? ImVec4(1, 0, 0, 1) : ImVec4(0, 1, 0, 1),
+                                  is_fault(i) ? "FAULT" : "OK");
+            }
+            
+            ImGui::EndTable();
+        }
+        
+        ImGui::End();
+    }
+    
+    void render_diagnostics() {
+        ImGui::Begin("Diagnostics");
+        
+        // System Health
+        ImGui::Text("System Health:");
+        
+        float cpu_usage = get_cpu_usage();
+        ImGui::Text("CPU Usage:");
+        ImGui::SameLine();
+        ImGui::ProgressBar(cpu_usage / 100.0f, ImVec2(200, 0), 
+                          fmt::format("{:.1f}%%", cpu_usage).c_str());
+        
+        float mem_usage = get_memory_usage();
+        ImGui::Text("Memory Usage:");
+        ImGui::SameLine();
+        ImGui::ProgressBar(mem_usage / 100.0f, ImVec2(200, 0),
+                          fmt::format("{:.1f}%%", mem_usage).c_str());
+        
+        ImGui::Separator();
+        
+        // Communication Status
+        ImGui::Text("Communication:");
+        
+        render_status_light("CAN Bus", is_can_connected());
+        render_status_light("DDS", is_dds_connected());
+        render_status_light("Emergency Stop", !emergency_stop);
+        
+        ImGui::Separator();
+        
+        // Error Log
+        ImGui::Text("Recent Errors:");
+        
+        ImGui::BeginChild("ErrorLog", ImVec2(0, 200), true,
+                         ImGuiWindowFlags_HorizontalScrollbar);
+        
+        for (const auto& error : get_recent_errors()) {
+            ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1),
+                              "[%s] %s", 
+                              error.timestamp.c_str(),
+                              error.message.c_str());
+        }
+        
+        ImGui::EndChild();
+        
+        ImGui::End();
+    }
+    
+    void render_status_light(const char* label, bool status) {
+        ImGui::Text("%s:", label);
+        ImGui::SameLine();
+        
+        ImDrawList* draw_list = ImGui::GetWindowDrawList();
+        ImVec2 pos = ImGui::GetCursorScreenPos();
+        
+        ImU32 color = status ? IM_COL32(0, 255, 0, 255) : IM_COL32(255, 0, 0, 255);
+        draw_list->AddCircleFilled(ImVec2(pos.x + 10, pos.y + 10), 8, color);
+        
+        ImGui::Dummy(ImVec2(20, 20));
+    }
+    
+    void send_command() {
+        // Send command based on control mode
+        switch (control_mode) {
+            case POSITION:
+                // Send position command
+                break;
+            case VELOCITY:
+                // Send velocity command
+                break;
+            case TORQUE:
+                // Send torque command
+                break;
+        }
+    }
+    
+    float get_temperature(int joint) { return 25.0f + joint * 2.0f; }
+    float get_current(int joint) { return 0.5f + joint * 0.1f; }
+    bool is_fault(int joint) { return false; }
+    float get_cpu_usage() { return 45.0f; }
+    float get_memory_usage() { return 62.0f; }
+    bool is_can_connected() { return true; }
+    bool is_dds_connected() { return true; }
+    
+    struct ErrorEntry {
+        std::string timestamp;
+        std::string message;
+    };
+    
+    std::vector<ErrorEntry> get_recent_errors() {
+        return {
+            {"12:34:56", "Motor 3 overcurrent warning"},
+            {"12:35:12", "Communication timeout on CAN bus"},
+            {"12:36:45", "Temperature warning on motor 5"}
+        };
+    }
+};
+
+} // namespace robot
+```
+
+---
+
+## 19. Real-Time Visualization
+
+### 19.1 High-Performance Plotting
+
+```cpp
+// realtime_visualization.cpp
+#include <implot.h>
+#include <deque>
+
+namespace robot {
+
+class RealtimePlotter {
+    struct PlotData {
+        std::deque<float> x_data;
+        std::deque<float> y_data;
+        size_t max_points;
+        float x_counter = 0;
+        
+        explicit PlotData(size_t max = 1000) : max_points(max) {}
+        
+        void add_point(float y) {
+            x_data.push_back(x_counter++);
+            y_data.push_back(y);
+            
+            if (x_data.size() > max_points) {
+                x_data.pop_front();
+                y_data.pop_front();
+            }
+        }
+        
+        void clear() {
+            x_data.clear();
+            y_data.clear();
+            x_counter = 0;
+        }
+    };
+    
+    std::map<std::string, PlotData> plots;
+    bool paused = false;
+    float time_window = 10.0f;  // seconds
+    
+public:
+    void add_data(const std::string& series, float value) {
+        if (!paused) {
+            plots[series].add_point(value);
+        }
+    }
+    
+    void render() {
+        ImGui::Begin("Real-Time Plots");
+        
+        // Controls
+        if (ImGui::Button(paused ? "Resume" : "Pause")) {
+            paused = !paused;
+        }
+        
+        ImGui::SameLine();
+        if (ImGui::Button("Clear")) {
+            for (auto& [name, data] : plots) {
+                data.clear();
+            }
+        }
+        
+        ImGui::SameLine();
+        ImGui::SliderFloat("Time Window", &time_window, 1.0f, 60.0f, "%.1f s");
+        
+        // Plot
+        if (ImPlot::BeginPlot("##Realtime", ImVec2(-1, -1))) {
+            ImPlot::SetupAxes("Time", "Value");
+            
+            // Dynamic axis limits
+            if (!plots.empty()) {
+                float x_max = plots.begin()->second.x_counter;
+                float x_min = std::max(0.0f, x_max - time_window * 100);  // Assuming 100Hz
+                ImPlot::SetupAxisLimits(ImAxis_X1, x_min, x_max, ImGuiCond_Always);
+            }
+            
+            // Plot each series
+            for (const auto& [name, data] : plots) {
+                if (!data.x_data.empty()) {
+                    ImPlot::PlotLine(name.c_str(),
+                                    data.x_data.data(),
+                                    data.y_data.data(),
+                                    data.x_data.size());
+                }
+            }
+            
+            ImPlot::EndPlot();
+        }
+        
+        ImGui::End();
+    }
+};
+
+// 3D Visualization
+class Robot3DViewer {
+    struct JointTransform {
+        Eigen::Vector3f position;
+        Eigen::Quaternionf rotation;
+    };
+    
+    std::array<JointTransform, 6> joint_transforms;
+    float camera_distance = 5.0f;
+    float camera_angle_x = 45.0f;
+    float camera_angle_y = 30.0f;
+    
+public:
+    void update_joint_angles(const std::array<float, 6>& angles) {
+        // Update forward kinematics
+        // This would use your actual robot kinematics
+        for (size_t i = 0; i < 6; ++i) {
+            joint_transforms[i].rotation = 
+                Eigen::AngleAxisf(angles[i], Eigen::Vector3f::UnitZ());
+        }
+    }
+    
+    void render() {
+        ImGui::Begin("3D Robot View");
+        
+        // Camera controls
+        ImGui::SliderFloat("Distance", &camera_distance, 1.0f, 10.0f);
+        ImGui::SliderFloat("Angle X", &camera_angle_x, -180.0f, 180.0f);
+        ImGui::SliderFloat("Angle Y", &camera_angle_y, -90.0f, 90.0f);
+        
+        // Get available region
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        
+        // Render to texture (simplified - actual implementation would use OpenGL)
+        ImGui::Image(render_robot_to_texture(), avail);
+        
+        ImGui::End();
+    }
+    
+private:
+    ImTextureID render_robot_to_texture() {
+        // This would render the robot using OpenGL
+        // and return the texture ID
+        return nullptr;
+    }
+};
+
+} // namespace robot
+```
+
+---
+
+## Part VI: Production
+
+## 20. Build System and Tooling
+
+### 20.1 Complete CMakeLists.txt
+
+```cmake
+# CMakeLists.txt
+cmake_minimum_required(VERSION 3.20)
+project(RobotSystem VERSION 1.0.0 LANGUAGES CXX)
+
+# C++ Standard
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Build type
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Export compile commands for IDEs
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Options
+option(BUILD_TESTS "Build test programs" ON)
+option(BUILD_GUI "Build GUI components" ON)
+option(USE_SANITIZERS "Enable sanitizers in debug build" ON)
+option(USE_STATIC_ANALYSIS "Run static analysis" ON)
+
+# Compiler flags
+set(WARNING_FLAGS
+    -Wall -Wextra -Wpedantic -Werror
+    -Wcast-align -Wcast-qual
+    -Wconversion -Wsign-conversion
+    -Wdouble-promotion -Wformat=2
+    -Wnull-dereference -Wold-style-cast
+    -Woverloaded-virtual -Wshadow
+    -Wunused -Wno-unused-parameter
+)
+
+# Platform-specific flags
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(${WARNING_FLAGS})
+    
+    # Debug flags
+    set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
+    
+    # Release flags
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -flto")
+    
+    # Sanitizers for debug
+    if(USE_SANITIZERS AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+        add_compile_options(
+            -fsanitize=address
+            -fsanitize=undefined
+            -fsanitize=leak
+            -fno-omit-frame-pointer
+        )
+        add_link_options(
+            -fsanitize=address
+            -fsanitize=undefined
+            -fsanitize=leak
+        )
+    endif()
+endif()
+
+# Find packages
+find_package(fmt REQUIRED)
+find_package(spdlog REQUIRED)
+find_package(Eigen3 REQUIRED)
+find_package(Threads REQUIRED)
+
+# Find optional packages
+find_package(CycloneDDS QUIET)
+if(CycloneDDS_FOUND)
+    message(STATUS "CycloneDDS found")
+    add_definitions(-DHAS_CYCLONEDDS)
+endif()
+
+if(BUILD_GUI)
+    find_package(glfw3 REQUIRED)
+    find_package(OpenGL REQUIRED)
+    find_package(imgui REQUIRED)
+endif()
+
+# Include directories
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# Library sources
+set(LIB_SOURCES
+    src/core/error_codes.cpp
+    src/core/robot_system.cpp
+    src/control/motor_controller.cpp
+    src/control/trajectory_generator.cpp
+    src/drivers/can_driver.cpp
+    src/comm/dds_manager.cpp
+    src/utils/logger.cpp
+)
+
+# Create main library
+add_library(robot_lib STATIC ${LIB_SOURCES})
+
+target_link_libraries(robot_lib PUBLIC
+    fmt::fmt
+    spdlog::spdlog
+    Eigen3::Eigen
+    Threads::Threads
+)
+
+if(CycloneDDS_FOUND)
+    target_link_libraries(robot_lib PUBLIC
+        CycloneDDS::ddsc
+    )
+endif()
+
+# Main executable
+add_executable(robot_control src/main.cpp)
+target_link_libraries(robot_control PRIVATE robot_lib)
+
+# GUI executable
+if(BUILD_GUI)
+    add_executable(robot_gui 
+        src/ui/main_gui.cpp
+        src/ui/control_panel.cpp
+        src/ui/visualization.cpp
+    )
+    
+    target_link_libraries(robot_gui PRIVATE
+        robot_lib
+        glfw
+        OpenGL::GL
+        imgui::imgui
+    )
+endif()
+
+# Tests
+if(BUILD_TESTS)
+    Include(FetchContent)
+    
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG v3.4.0
+    )
+    
+    FetchContent_MakeAvailable(Catch2)
+    
+    enable_testing()
+    
+    add_executable(tests
+        tests/test_main.cpp
+        tests/test_motor_controller.cpp
+        tests/test_robot_system.cpp
+        tests/test_trajectory.cpp
+    )
+    
+    target_link_libraries(tests PRIVATE
+        robot_lib
+        Catch2::Catch2WithMain
+    )
+    
+    include(CTest)
+    include(Catch)
+    catch_discover_tests(tests)
+endif()
+
+# Installation
+install(TARGETS robot_control robot_lib
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+install(DIRECTORY include/
+    DESTINATION include
+)
+
+# Package configuration
+include(CPack)
+set(CPACK_PACKAGE_NAME "RobotSystem")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_GENERATOR "DEB;TGZ")
+```
+
+### 20.2 Static Analysis Integration
+
+```python
+#!/usr/bin/env python3
+# tools/static_analysis.py
+
+import subprocess
+import sys
+import os
+from pathlib import Path
+
+def run_clang_tidy(source_files):
+    """Run clang-tidy on source files."""
+    print("Running clang-tidy...")
+    cmd = [
+        "clang-tidy",
+        "-p", "build",
+        "--checks=-*,bugprone-*,performance-*,readability-*,modernize-*",
+        "--warnings-as-errors=*"
+    ] + source_files
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("clang-tidy found issues:")
+        print(result.stdout)
+        return False
+    return True
+
+def run_cppcheck(source_dir):
+    """Run cppcheck on source directory."""
+    print("Running cppcheck...")
+    cmd = [
+        "cppcheck",
+        "--enable=all",
+        "--error-exitcode=1",
+        "--suppress=missingIncludeSystem",
+        "--quiet",
+        source_dir
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("cppcheck found issues:")
+        print(result.stdout)
+        return False
+    return True
+
+def run_cpplint(source_files):
+    """Run cpplint on source files."""
+    print("Running cpplint...")
+    cmd = [
+        "cpplint",
+        "--filter=-build/include_subdir,-legal/copyright",
+        "--linelength=100"
+    ] + source_files
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("cpplint found style issues:")
+        print(result.stderr)
+        return False
+    return True
+
+def check_includes(source_files):
+    """Check for forbidden includes."""
+    forbidden = [
+        "<iostream>",  # Use fmt instead
+        "<boost/",     # No boost
+        "<experimental/"  # No experimental features
+    ]
+    
+    issues = []
+    for filepath in source_files:
+        with open(filepath, 'r') as f:
+            for line_no, line in enumerate(f, 1):
+                for forbidden_include in forbidden:
+                    if forbidden_include in line:
+                        issues.append(f"{filepath}:{line_no}: Forbidden include: {forbidden_include}")
+    
+    if issues:
+        print("Forbidden includes found:")
+        for issue in issues:
+            print(f"  {issue}")
+        return False
+    return True
+
+def main():
+    # Get all C++ source files
+    src_dir = Path("src")
+    source_files = list(src_dir.glob("**/*.cpp")) + list(src_dir.glob("**/*.h"))
+    source_files = [str(f) for f in source_files]
+    
+    if not source_files:
+        print("No source files found")
+        return 1
+    
+    # Run all checks
+    all_passed = True
+    
+    if not run_clang_tidy(source_files):
+        all_passed = False
+    
+    if not run_cppcheck("src"):
+        all_passed = False
+    
+    if not run_cpplint(source_files):
+        all_passed = False
+    
+    if not check_includes(source_files):
+        all_passed = False
+    
+    if all_passed:
+        print("All static analysis checks passed!")
+        return 0
+    else:
+        print("Some checks failed. Please fix the issues.")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+---
+
+## 21. Static Analysis and Sanitizers
+
+### 21.1 Sanitizer Configuration
+
+```cpp
+// sanitizer_config.h
+#pragma once
+
+// Address Sanitizer options
+#ifdef __has_feature
+    #if __has_feature(address_sanitizer)
+        #define ASAN_ENABLED
+    #endif
+#elif defined(__SANITIZE_ADDRESS__)
+    #define ASAN_ENABLED
+#endif
+
+#ifdef ASAN_ENABLED
+extern "C" {
+    const char* __asan_default_options() {
+        return "strict_string_checks=1:"
+               "detect_stack_use_after_return=1:"
+               "check_initialization_order=1:"
+               "strict_init_order=1:"
+               "print_stats=1:"
+               "halt_on_error=0";
+    }
+}
+#endif
+
+// UBSan options
+#ifdef __has_feature
+    #if __has_feature(undefined_behavior_sanitizer)
+        #define UBSAN_ENABLED
+    #endif
+#elif defined(__SANITIZE_UNDEFINED__)
+    #define UBSAN_ENABLED
+#endif
+
+#ifdef UBSAN_ENABLED
+extern "C" {
+    const char* __ubsan_default_options() {
+        return "print_stacktrace=1:"
+               "halt_on_error=0:"
+               "suppressions=ubsan.supp";
+    }
+}
+#endif
+
+// Thread Sanitizer options
+#ifdef __has_feature
+    #if __has_feature(thread_sanitizer)
+        #define TSAN_ENABLED
+    #endif
+#elif defined(__SANITIZE_THREAD__)
+    #define TSAN_ENABLED
+#endif
+
+#ifdef TSAN_ENABLED
+extern "C" {
+    const char* __tsan_default_options() {
+        return "halt_on_error=0:"
+               "history_size=7:"
+               "suppressions=tsan.supp";
+    }
+}
+#endif
+```
+
+### 21.2 Valgrind Suppression File
+
+```
+# valgrind.supp
+{
+   OpenGL/Mesa
+   Memcheck:Leak
+   ...
+   obj:*/libGL.so*
+}
+
+{
+   DDS/CycloneDDS
+   Memcheck:Leak
+   ...
+   obj:*/libddsc.so*
+}
+```
+
+---
+
+## 22. Debugging and Profiling
+
+### 22.1 Performance Profiling
+
+```cpp
+// profiler.cpp
+#include <chrono>
+#include <map>
+#include <fmt/core.h>
+
+namespace robot {
+
+class Profiler {
+    struct ProfileData {
+        uint64_t total_time_us = 0;
+        uint64_t call_count = 0;
+        uint64_t min_time_us = UINT64_MAX;
+        uint64_t max_time_us = 0;
+    };
+    
+    static inline std::map<std::string, ProfileData> profiles;
+    
+public:
+    class ScopedTimer {
+        std::string name;
+        std::chrono::high_resolution_clock::time_point start;
+        
+    public:
+        explicit ScopedTimer(std::string n) 
+            : name(std::move(n))
+            , start(std::chrono::high_resolution_clock::now()) {}
+        
+        ~ScopedTimer() {
+            auto end = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>
+                           (end - start).count();
+            
+            auto& data = profiles[name];
+            data.total_time_us += duration;
+            data.call_count++;
+            data.min_time_us = std::min(data.min_time_us, 
+                                        static_cast<uint64_t>(duration));
+            data.max_time_us = std::max(data.max_time_us, 
+                                        static_cast<uint64_t>(duration));
+        }
+    };
+    
+    static void print_report() {
+        fmt::print("\n=== Performance Profile ===\n");
+        fmt::print("{:<30} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
+                  "Function", "Calls", "Total(ms)", "Avg(us)", "Min(us)", "Max(us)");
+        fmt::print("{:-<90}\n", "");
+        
+        for (const auto& [name, data] : profiles) {
+            double total_ms = data.total_time_us / 1000.0;
+            double avg_us = data.total_time_us / 
+                           static_cast<double>(data.call_count);
+            
+            fmt::print("{:<30} {:>10} {:>10.2f} {:>10.2f} {:>10} {:>10}\n",
+                      name, data.call_count, total_ms, avg_us,
+                      data.min_time_us, data.max_time_us);
+        }
+    }
+    
+    static void reset() {
+        profiles.clear();
+    }
+};
+
+#ifdef ENABLE_PROFILING
+    #define PROFILE(name) robot::Profiler::ScopedTimer _timer(name)
+#else
+    #define PROFILE(name) ((void)0)
+#endif
+
+// Usage
+void example_function() {
+    PROFILE("example_function");
+    
+    // Function body
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
+} // namespace robot
+```
+
+---
+
+## 23. Complete Robot Example
+
+### 23.1 Full Robot System Implementation
+
+```cpp
+// complete_robot_system.cpp
+#include <thread>
+#include <atomic>
+#include <memory>
+
+namespace robot {
+
+class CompleteRobotSystem {
+public:
+    // Configuration
+    struct Config {
+        int can_bus_id = 0;
+        int dds_domain = 42;
+        bool enable_gui = true;
+        bool enable_logging = true;
+        std::string config_file = "robot.yaml";
+    };
+    
+private:
+    Config config;
+    
+    // Core components
+    std::unique_ptr<MotorController> motors[6];
+    std::unique_ptr<TrajectoryGenerator> trajectory_gen;
+    std::unique_ptr<DDSManager> dds;
+    std::unique_ptr<Logger> logger;
+    
+    // Thread management
+    std::thread control_thread;
+    std::thread sensor_thread;
+    std::thread comm_thread;
+    std::thread gui_thread;
+    
+    // Communication
+    SPSCQueue<SensorData, 128> sensor_queue;
+    SPSCQueue<MotorCommand, 128> command_queue;
+    Channel<SystemCommand> system_channel{10};
+    
+    // State
+    std::atomic<bool> running{false};
+    std::atomic<bool> emergency_stop{false};
+    std::atomic<SystemState> state{SystemState::UNINITIALIZED};
+    
+    // GUI
+    std::unique_ptr<ImGuiApplication> gui;
+    std::unique_ptr<RobotControlPanel> control_panel;
+    
+public:
+    explicit CompleteRobotSystem(const Config& cfg) : config(cfg) {}
+    
+    Result<void> initialize() {
+        // Initialize logging
+        if (config.enable_logging) {
+            LogManager::initialize();
+            logger = std::make_unique<Logger>("RobotSystem");
+            logger->info("Initializing robot system");
+        }
+        
+        // Initialize motors
+        for (int i = 0; i < 6; ++i) {
+            motors[i] = std::make_unique<MotorController>(i);
+            if (auto result = motors[i]->initialize(); !result) {
+                logger->error("Failed to initialize motor {}: {}",
+                            i, to_string(result.error()));
+                return result;
+            }
+        }
+        
+        // Initialize trajectory generator
+        trajectory_gen = std::make_unique<TrajectoryGenerator>();
+        
+        // Initialize DDS
+        if (config.dds_domain >= 0) {
+            dds = std::make_unique<DDSManager>(config.dds_domain);
+        }
+        
+        // Initialize GUI
+        if (config.enable_gui) {
+            gui = std::make_unique<ImGuiApplication>();
+            if (auto result = gui->initialize(); !result) {
+                logger->error("Failed to initialize GUI: {}",
+                            to_string(result.error()));
+                return result;
+            }
+            control_panel = std::make_unique<RobotControlPanel>();
+        }
+        
+        state = SystemState::INITIALIZED;
+        logger->info("Robot system initialized successfully");
+        return Ok();
+    }
+    
+    Result<void> start() {
+        if (state != SystemState::INITIALIZED) {
+            return Err<void>(ErrorCode::SYS_INVALID_STATE);
+        }
+        
+        running = true;
+        
+        // Start threads
+        control_thread = std::thread([this]() { control_loop(); });
+        sensor_thread = std::thread([this]() { sensor_loop(); });
+        comm_thread = std::thread([this]() { communication_loop(); });
+        
+        if (config.enable_gui) {
+            gui_thread = std::thread([this]() { gui_loop(); });
+        }
+        
+        state = SystemState::RUNNING;
+        logger->info("Robot system started");
+        return Ok();
+    }
+    
+    Result<void> stop() {
+        logger->info("Stopping robot system");
+        
+        // Signal threads to stop
+        running = false;
+        system_channel.close();
+        
+        // Join threads
+        if (control_thread.joinable()) control_thread.join();
+        if (sensor_thread.joinable()) sensor_thread.join();
+        if (comm_thread.joinable()) comm_thread.join();
+        if (gui_thread.joinable()) gui_thread.join();
+        
+        // Shutdown components
+        for (auto& motor : motors) {
+            motor->shutdown();
+        }
+        
+        state = SystemState::STOPPED;
+        logger->info("Robot system stopped");
+        return Ok();
+    }
+    
+private:
+    void control_loop() {
+        set_thread_name("control");
+        configure_realtime_thread(99, 2);  // Priority 99, CPU 2
+        
+        const auto period = std::chrono::microseconds(1000);  // 1kHz
+        auto next_wake = std::chrono::steady_clock::now();
+        
+        while (running) {
+            PROFILE("control_loop");
+            
+            next_wake += period;
+            std::this_thread::sleep_until(next_wake);
+            
+            // Check emergency stop
+            if (emergency_stop) {
+                for (auto& motor : motors) {
+                    motor->emergency_stop();
+                }
+                continue;
+            }
+            
+            // Read sensors
+            SensorData sensor_data;
+            if (sensor_queue.try_pop()) {
+                process_sensor_data(sensor_data);
+            }
+            
+            // Compute control
+            auto commands = compute_control();
+            
+            // Send commands
+            for (const auto& cmd : commands) {
+                command_queue.try_push(cmd);
+            }
+            
+            // Check deadline
+            auto now = std::chrono::steady_clock::now();
+            if (now > next_wake) {
+                logger->warn("Control loop deadline miss");
+            }
+        }
+    }
+    
+    void sensor_loop() {
+        set_thread_name("sensors");
+        
+        while (running) {
+            PROFILE("sensor_loop");
+            
+            SensorData data;
+            
+            // Read from all motors
+            for (int i = 0; i < 6; ++i) {
+                auto pos_result = motors[i]->get_position();
+                auto vel_result = motors[i]->get_velocity();
+                
+                if (pos_result && vel_result) {
+                    data.positions[i] = *pos_result;
+                    data.velocities[i] = *vel_result;
+                }
+            }
+            
+            data.timestamp = get_timestamp_us();
+            
+            // Send to control thread
+            sensor_queue.try_push(data);
+            
+            // Publish via DDS
+            if (dds) {
+                publish_sensor_data(data);
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    void communication_loop() {
+        set_thread_name("comm");
+        
+        if (!dds) return;
+        
+        // Set up DDS subscribers
+        auto command_subscriber = dds->create_command_subscriber(
+            [this](const robot_msgs::MotorCommand& cmd) {
+                handle_dds_command(cmd);
+            });
+        
+        while (running) {
+            PROFILE("comm_loop");
+            
+            // Process system commands
+            if (auto cmd = system_channel.try_receive()) {
+                handle_system_command(*cmd);
+            }
+            
+            // Process outgoing commands
+            MotorCommand motor_cmd;
+            while (command_queue.try_pop(motor_cmd)) {
+                send_motor_command(motor_cmd);
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    
+    void gui_loop() {
+        set_thread_name("gui");
+        
+        while (running && !gui->should_close()) {
+            PROFILE("gui_loop");
+            
+            gui->begin_frame();
+            
+            // Render control panel
+            control_panel->render();
+            
+            // Update visualization
+            update_visualization();
+            
+            gui->end_frame();
+        }
+    }
+    
+    std::vector<MotorCommand> compute_control() {
+        // Your control algorithm here
+        std::vector<MotorCommand> commands;
+        
+        for (int i = 0; i < 6; ++i) {
+            MotorCommand cmd;
+            cmd.motor_id = i;
+            cmd.mode = MotorCommand::POSITION;
+            cmd.target = 0.0f;  // Computed target
+            commands.push_back(cmd);
+        }
+        
+        return commands;
+    }
+    
+    void process_sensor_data(const SensorData& data) {
+        // Process sensor data
+    }
+    
+    void publish_sensor_data(const SensorData& data) {
+        // Publish via DDS
+    }
+    
+    void handle_dds_command(const robot_msgs::MotorCommand& cmd) {
+        // Handle incoming DDS command
+    }
+    
+    void handle_system_command(const SystemCommand& cmd) {
+        // Handle system command
+    }
+    
+    void send_motor_command(const MotorCommand& cmd) {
+        if (cmd.motor_id >= 0 && cmd.motor_id < 6) {
+            motors[cmd.motor_id]->execute_command(cmd);
+        }
+    }
+    
+    void update_visualization() {
+        // Update 3D visualization
+    }
+    
+    void set_thread_name(const std::string& name) {
+        pthread_setname_np(pthread_self(), name.c_str());
+    }
+    
+    void configure_realtime_thread(int priority, int cpu_core) {
+        // Set CPU affinity
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu_core, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+        
+        // Set real-time priority
+        struct sched_param param;
+        param.sched_priority = priority;
+        pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+        
+        // Lock memory
+        mlockall(MCL_CURRENT | MCL_FUTURE);
+    }
+    
+    uint64_t get_timestamp_us() {
+        return std::chrono::steady_clock::now()
+               .time_since_epoch()
+               .count();
+    }
+};
+
+} // namespace robot
+
+// Main entry point
+int main(int argc, char* argv[]) {
+    using namespace robot;
+    
+    // Parse command line arguments
+    CompleteRobotSystem::Config config;
+    
+    CLI::App app{"Robot Control System"};
+    app.add_option("-c,--config", config.config_file, "Configuration file")
+       ->check(CLI::ExistingFile);
+    app.add_option("-d,--domain", config.dds_domain, "DDS domain ID");
+    app.add_flag("--no-gui", config.enable_gui, "Disable GUI");
+    app.add_flag("--no-log", config.enable_logging, "Disable logging");
+    
+    CLI11_PARSE(app, argc, argv);
+    
+    // Create and run robot system
+    CompleteRobotSystem robot(config);
+    
+    if (auto result = robot.initialize(); !result) {
+        fmt::print(stderr, "Failed to initialize: {}\n", 
+                  to_string(result.error()));
+        return 1;
+    }
+    
+    if (auto result = robot.start(); !result) {
+        fmt::print(stderr, "Failed to start: {}\n",
+                  to_string(result.error()));
+        return 1;
+    }
+    
+    // Set up signal handlers
+    std::signal(SIGINT, [](int) {
+        fmt::print("\nShutdown requested\n");
+        // Signal shutdown
+    });
+    
+    // Wait for shutdown
+    fmt::print("Robot system running. Press Ctrl+C to stop.\n");
+    
+    // Main thread can do other work or just wait
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        
+        // Check for shutdown signal
+        // ...
+    }
+    
+    // Stop system
+    robot.stop();
+    
+    // Print profiling report
+    #ifdef ENABLE_PROFILING
+    Profiler::print_report();
+    #endif
+    
+    return 0;
+}
+```
+
+---
+
+## Appendix A: Quick Reference
+
+### Thread Safety Cheat Sheet
+
+| Pattern | Use Case | Example |
+|---------|----------|---------|
+| `std::mutex` | Protect shared data | Simple critical sections |
+| `std::shared_mutex` | Many readers, few writers | Configuration data |
+| `std::atomic` | Lock-free single values | Flags, counters |
+| `SPSCQueue` | RT producer/consumer | Sensor data flow |
+| `Channel` | Go-style communication | Commands |
+| `std::condition_variable` | Thread synchronization | Producer-consumer |
+
+### Memory Ordering
+
+| Order | Use Case | Guarantees |
+|-------|----------|------------|
+| `memory_order_relaxed` | Counters | No synchronization |
+| `memory_order_acquire` | Read synchronization | See all releases before |
+| `memory_order_release` | Write synchronization | Visible to acquires |
+| `memory_order_seq_cst` | Default, safest | Total order |
+
+### Real-Time Checklist
+
+- [ ] No dynamic allocation
+- [ ] No system calls
+- [ ] No mutex locks
+- [ ] Fixed execution time
+- [ ] Memory locked (mlockall)
+- [ ] CPU affinity set
+- [ ] RT priority configured
+- [ ] Deadline monitoring
+
+---
+
+## Appendix B: Common Pitfalls
+
+### 1. Data Races
+
+```cpp
+// ❌ BAD: Data race
+int shared_data = 0;
+
+void thread1() {
+    shared_data++;  // Not atomic!
+}
+
+void thread2() {
+    shared_data++;  // Race condition
+}
+
+// ✅ GOOD: Use atomic
+std::atomic<int> shared_data{0};
+
+void thread1() {
+    shared_data.fetch_add(1);
+}
+```
+
+### 2. Deadlocks
+
+```cpp
+// ❌ BAD: Potential deadlock
+std::mutex m1, m2;
+
+void thread1() {
+    std::lock_guard<std::mutex> lock1(m1);
+    std::lock_guard<std::mutex> lock2(m2);
+}
+
+void thread2() {
+    std::lock_guard<std::mutex> lock2(m2);  // Different order!
+    std::lock_guard<std::mutex> lock1(m1);
+}
+
+// ✅ GOOD: Lock together
+void thread1() {
+    std::scoped_lock lock(m1, m2);
+}
+
+void thread2() {
+    std::scoped_lock lock(m1, m2);  // Same order
+}
+```
+
+### 3. Real-Time Violations
+
+```cpp
+// ❌ BAD: Allocation in RT
+void control_loop() {
+    std::vector<float> data;  // Allocation!
+    data.push_back(sensor_read());  // More allocation!
+}
+
+// ✅ GOOD: Pre-allocated
+std::array<float, 100> data;
+size_t index = 0;
+
+void control_loop() {
+    if (index < data.size()) {
+        data[index++] = sensor_read();
+    }
+}
+```
+
+---
+
+## Appendix C: Migration from Python
+
+### Python to C++ Patterns
+
+```python
+# Python: List comprehension
+squares = [x**2 for x in range(10) if x % 2 == 0]
+```
+
+```cpp
+// C++: Simple loop
+std::vector<int> squares;
+for (int x = 0; x < 10; ++x) {
+    if (x % 2 == 0) {
+        squares.push_back(x * x);
+    }
+}
+```
+
+```python
+# Python: Dictionary
+config = {
+    "motor_count": 6,
+    "control_rate": 1000,
+    "max_torque": 10.0
+}
+```
+
+```cpp
+// C++: Struct
+struct Config {
+    int motor_count = 6;
+    int control_rate = 1000;
+    float max_torque = 10.0;
+};
+```
+
+```python
+# Python: Context manager
+with open("file.txt") as f:
+    data = f.read()
+```
+
+```cpp
+// C++: RAII
+{
+    std::ifstream file("file.txt");
+    std::string data((std::istreambuf_iterator<char>(file)),
+                     std::istreambuf_iterator<char>());
+}  // File closed automatically
+```
+
+---
+
+## Final Notes
+
+This comprehensive guide provides:
+
+1. **Safety through tooling** - Sanitizers, static analysis, and strict compiler flags
+2. **Modern C++ patterns** - std::expected, smart pointers, structured bindings
+3. **Practical examples** - Complete implementations for robotics systems
+4. **Library integration** - fmt, spdlog, Catch2, Eigen, CycloneDDS, ImGui
+5. **Threading patterns** - Lock-free queues, channels, thread pools
+6. **Real-time guarantees** - Proper RT thread configuration and patterns
+7. **Production readiness** - Build systems, testing, profiling, debugging
+
+The guide balances safety with practicality, using established libraries rather than reinventing wheels, while maintaining clear patterns that Python developers can understand and follow.
